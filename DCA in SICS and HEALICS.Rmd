@@ -1,0 +1,265 @@
+---
+title: "DCA in SICS I/II and HEALICS"
+author: "SCS Rivrud, RJ Eck, ERH Heijkoop"
+output:
+  html_document:
+    code_folding: hide
+---
+
+**Load packages**
+```{r message=FALSE, warning=FALSE}
+library(rms)
+library(glmnet)
+library(pec)
+library(Hmisc)
+library(qreport)
+library(DescTools)
+library(e1071)
+library(ggpubr)
+library(bestNormalize)
+library(GGally)
+library(broom)
+library(MASS)
+library(adjustedCurves)
+library(pROC)
+library(rsample)
+library(riskRegression)
+library(here)
+library(RSQLite)
+library(gridExtra)
+library(kableExtra)
+library(grid)
+library(janitor)
+library(mice)
+library(miceafter)
+library(gtsummary)
+library(flextable)
+library(grid)
+library(forestploter)
+library(tidyverse)
+library(patchwork)
+library(dcurves)
+library(epiDisplay)
+
+#remotes::install_github("gweissman/gmish")
+library(gmish)
+
+``` 
+
+**Load R environment from execution of multiple logistic regression with MI**
+```{r eval=FALSE}
+load('multiple_logistic_reg_mi_environment.RData')
+```
+
+**DCA with confidence interval (according to https://doi.org/10.1186/1472-6947-8-53)**
+```{r eval=FALSE}
+#set thresholds
+thresholds <- seq(0, 1, by = 0.001)
+
+#make list to store the results df for each resample
+results_list <- list()
+
+for (i in 1:1000) {
+  #resample sics_bb_prob with replacement
+  resampled_data <- sample_n(sics_bb_prob, size = nrow(sics_bb_prob), replace = TRUE)
+  
+  #make empty df to store results for resample 
+  results_df <- data.frame(threshold = numeric(), tp_rate = integer(), fp_rate = integer())
+  
+  for (threshold in thresholds) {
+    #determine TP and FP for the current threshold in the resampled dataset
+    TP <- sum(resampled_data$prob_vte >= threshold & resampled_data$status_dich == 1) / nrow(resampled_data)
+    FP <- sum(resampled_data$prob_vte >= threshold & resampled_data$status_dich == 0) / nrow(resampled_data)
+    
+    #add to df to store results
+    results_df <- rbind(results_df, data.frame(threshold = threshold, tp_rate = TP, fp_rate = FP))
+  }
+  
+  #remove rows where both TP and FP are 0
+  results_df <- subset(results_df, !(tp_rate == 0 & fp_rate == 0)) 
+  
+  #calculate net benefit for each threshold
+  results_df <- results_df %>%
+    mutate(net_benefit = tp_rate - fp_rate * (threshold / (1 - threshold)))
+  
+  #store the results in the list
+  results_list[[i]] <- results_df
+}
+
+dca_df_bootstrapped <- bind_rows(results_list) %>%
+  group_by(threshold) %>%
+  summarise(
+    net_benefit_lower = quantile(net_benefit, probs = 0.025, na.rm = TRUE),
+    net_benefit_upper = quantile(net_benefit, probs = 0.975, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+dca_df <- data.frame(threshold = numeric(), true_positives = integer(), false_positives = integer())
+
+for (threshold in thresholds) {
+  #determine true positives and false positives for the current threshold
+  TP <- sum(sics_bb_prob$prob_vte >= threshold & sics_bb_prob$status_dich == 1)/nrow(sics_bb_prob)
+  FP <- sum(sics_bb_prob$prob_vte >= threshold & sics_bb_prob$status_dich == 0)/nrow(sics_bb_prob)
+  
+  #add to dca_df
+  dca_df <- rbind(dca_df, data.frame(threshold = threshold, tp_rate = TP, fp_rate = FP))
+}
+
+#remove rows where both TP and FP are 0
+dca_df <- subset(dca_df, !(tp_rate == 0 & fp_rate == 0)) 
+dca_df <- dca_df %>%
+  mutate(net_benefit = tp_rate - fp_rate*(threshold/(1-threshold))) %>%
+  left_join(dca_df_bootstrapped, by = "threshold")
+
+#calc incidence
+incidence_vte <- length(sics_bb_prob$status_dich[sics_bb_prob$status_dich == "1"]) / nrow(sics_bb_prob)
+
+y_intercept = max(dca_df$net_benefit)
+x_intercept = incidence_vte
+
+#calculate slope using the two points: (x1,y1) = (0.014, 0) and (x2,y2) = (0, y_intercept)
+slope = -(0 - x_intercept) / (0 - y_intercept)
+
+```
+
+**Analyse NB and test tradeoff**
+```{r eval=FALSE}
+dca_default <- dca(status_dich ~ prob_vte,
+    data = sics_bb_prob,
+    thresholds = seq(0, 1, 0.001),
+    label = list(prob_vte = "model")
+) %>%
+  as_tibble()
+
+dca_default_all <- dca_default %>%
+  filter(label == "Treat All") %>%
+  select(threshold, pos_rate_all = pos_rate, tp_rate_all = tp_rate, fp_rate_all = fp_rate, net_benefit_all = net_benefit)
+
+dca_default_none <- dca_default %>%
+  filter(label == "Treat None") %>%
+  select(threshold, pos_rate_none = pos_rate, tp_rate_none = tp_rate, fp_rate_none = fp_rate, net_benefit_none = net_benefit)
+
+dca_default_model <- dca_default %>%
+  filter(label == "model")%>%
+  select(threshold, pos_rate_model = pos_rate, tp_rate_model = tp_rate, fp_rate_model = fp_rate, net_benefit_model = net_benefit) %>%
+  subset(!(tp_rate_model == 0 & fp_rate_model == 0))
+
+
+dca_default <- left_join(dca_default_model, dca_default_all, by = "threshold") %>%
+  left_join(dca_default_none, by = "threshold") %>%
+  filter(net_benefit_model > net_benefit_none & net_benefit_model > net_benefit_all)
+
+dca_default$delta_net_benefit <- apply(dca_default, 1, function(row) {
+  #calculate differences
+  diff_ab <- abs(row['net_benefit_model'] - row['net_benefit_all'])
+  diff_ac <- abs(row['net_benefit_model'] - row['net_benefit_none'])
+  
+  #return the smallest difference
+  min(diff_ab, diff_ac)
+})
+
+dca_default$test_tradeoff <- apply(dca_default, 1, function(row) {
+  #calculate test tradeoffs for treat all and treat none
+  tt_treat_all <- 1/abs(incidence_vte - row['delta_net_benefit'])
+  tt_treat_none <- 1/abs(0 - row['delta_net_benefit'])
+  
+  #return the largest value
+  max(tt_treat_all, tt_treat_none)
+})
+
+
+threshold_delta_nb_plot <- ggplot(dca_default, aes(x = ((threshold/ incidence_vte) - 1) * 100
+)) + 
+  geom_line(aes(y = delta_net_benefit), color = "darkblue") +
+    expand_limits(x = 0, y = 0.004) + #ensure the plot's zero point starts exactly at the bottom left corner (otherwise CIs look weird)
+  scale_x_continuous(expand = c(0, 0)) + #remove padding around x-axis
+  scale_y_continuous(expand = c(0, 0)) + #remove padding around y-axis
+  theme_minimal() + 
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1),
+        plot.title = element_text(hjust = 0.5, family = "Times New Roman"), 
+        axis.title = element_text(family = "Times New Roman"),
+        axis.text = element_text(family = "Times New Roman"),
+        axis.line = element_line(color = "black"),
+        plot.margin = unit(c(1,1,1,1), "lines"),
+        text = element_text(family = "Times New Roman")) +
+  labs(x ="% increase in risk relative to baseline risk of VTE", y = "ΔNB")
+
+threshold_tt_plot <- ggplot(dca_default, aes(x = ((threshold/ incidence_vte) - 1) * 100
+)) + 
+  geom_line(aes(y = test_tradeoff), color = "darkblue") +
+    expand_limits(x = 0, y = 0.004) + #ensure the plot's zero point starts exactly at the bottom left corner (otherwise CIs look weird)
+  scale_x_continuous(expand = c(0, 0), limits = c(0, 300)) + #remove padding around x-axis
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 30000)) + #remove padding around y-axis
+  theme_minimal() + 
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1),
+        plot.title = element_text(hjust = 0.5, family = "Times New Roman"), 
+        axis.title = element_text(family = "Times New Roman"),
+        axis.text = element_text(family = "Times New Roman"),
+        axis.line = element_line(color = "black"),
+        plot.margin = unit(c(1,1,1,1), "lines"),
+        text = element_text(family = "Times New Roman")) +
+  labs(x ="% increase in risk relative to baseline risk of VTE", y = "Test tradeoff")
+
+max_delta_nb <- dca_default %>%
+  filter(delta_net_benefit == max(delta_net_benefit))
+
+```
+
+**Make DCA plot**
+```{r eval=FALSE}
+dca_plot <- ggplot(dca_df, aes(x = threshold, y = net_benefit)) + 
+  geom_smooth(method = "loess", span=0.2, se = FALSE, color = "darkblue", size = 0.5) + 
+  geom_ribbon(aes(ymin = net_benefit_lower, ymax = net_benefit_upper), alpha = 0.2, fill = "darkblue") + 
+  geom_abline(intercept = y_intercept, slope = slope, color = "darkred", size = 0.5) + 
+  labs(title = "Decision Curve Analysis", x = "Threshold Probability", y = "Net Benefit") +
+  geom_hline(yintercept = 0, color = "darkgreen") +
+  expand_limits(x = 0, y = 0) + #ensure the plot's zero point starts exactly at the bottom left corner (otherwise CIs look weird)
+  scale_x_continuous(expand = c(0, 0)) + #remove padding around x-axis
+  scale_y_continuous(expand = c(0, 0)) + #remove padding around y-axis
+  theme_minimal() + 
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        panel.border = element_rect(colour = "black", fill=NA, size=1),
+        plot.title = element_text(hjust = 0.5, family = "Times New Roman"), 
+        axis.title = element_text(family = "Times New Roman"),
+        axis.text = element_text(family = "Times New Roman"),
+        axis.line = element_line(color = "black"),
+        plot.margin = unit(c(1,1,1,1), "lines"),
+        text = element_text(family = "Times New Roman")) 
+```
+
+**Save R environment**
+```{r eval=FALSE}
+save.image(file ='dca_environment.RData')
+```
+
+**Load R environment**
+```{r}
+load('dca_environment.RData')
+```
+
+
+
+**Print DCA plot**
+```{r fig.height=6, fig.width=8}
+dca_plot
+```
+
+**Print treatment tradeoff against risk threshold**
+```{r fig.height=8, fig.width=8}
+threshold_tt_plot
+```
+
+**Print treatment tradeoff against risk threshold**
+```{r fig.height=8, fig.width=8}
+threshold_delta_nb_plot
+```
+
+
+```{r}
+test <- dca_default %>%
+  filter(threshold >= 0.011 & threshold <= 0.047)
+
+summary(test$test_tradeoff)
+```
+
