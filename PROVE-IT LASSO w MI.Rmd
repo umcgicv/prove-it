@@ -1,0 +1,581 @@
+---
+title: "PROVE-IT LASSO with MI"
+output:
+  html_document:
+    code_folding: hide
+---
+
+**load packages**
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(pacman)
+library(ResourceSelection)
+library(adjustedCurves)
+library(dcurves)
+library(here)
+library(adjustedCurves)
+library(gmish)
+library(mice)
+library(scales)
+library(miceadds)
+library("plotrix")
+library(DescTools)
+library(foreach)
+library(doParallel)
+library(pROC)
+library(future)
+library(einr)
+library(gridExtra)
+#install.packages("remotes")
+#remotes::install_github("3inar/einr")
+library(contsurvplot)
+library(precrec)
+library(PRROC)
+library(broom)
+library(plotROC)
+library(Greg)
+library(future.apply)
+library(glmnet)
+library(sAIC)
+library(timeROC)
+library(survivalROC)
+pacman::p_load(
+  survival,
+  rms,
+  cmprsk,
+  riskRegression,
+  mstate,
+  pseudo,
+  pec,
+  plotrix,
+  knitr,
+  splines,
+  kableExtra,
+  gtsummary,
+  boot,
+  rsample,
+  gridExtra,
+  webshot,
+  tidycmprsk,  
+  Hmisc,
+  data.table,
+  lubridate,
+  here,
+  DBI,
+  RSQLite,
+  pROC,
+  reshape2,
+  dbplyr,
+  stringr,
+  readxl,
+  writexl,
+  stringi,
+  devtools,
+  ggsurvfit,
+  tidyr,
+  dplyr,
+  ggplot2,
+  mgcv,
+  pammtools
+)
+library(caret)
+library(glmnet)
+library(einr)
+set.seed(42)
+
+```
+
+**Boostrap function for internal validation**
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+#define bootstrap function
+bootstrap_validation_logreg <- function(data, response, app_cv_fit, app_best_lambda, n_bootstrap) {
+  
+  #make storage for apparent values (original model tested on bootstrap dataset)
+  auc_values_apparent <- numeric(n_bootstrap)
+  brier_score_apparent <- numeric(n_bootstrap) 
+  emax_apparent <- numeric(n_bootstrap)
+  e50_apparent <- numeric(n_bootstrap)
+  e90_apparent <- numeric(n_bootstrap)
+  r2_apparent <- numeric(n_bootstrap)
+  ici_apparent <- numeric(n_bootstrap)
+
+  #make storage for original values (bootstrap model tested on original dataset)
+  auc_values_corrected <- numeric(n_bootstrap)
+  brier_score_corrected <- numeric(n_bootstrap) 
+  emax_corrected <- numeric(n_bootstrap)
+  e50_corrected <- numeric(n_bootstrap)
+  e90_corrected <- numeric(n_bootstrap)
+  r2_corrected <- numeric(n_bootstrap)
+  ici_corrected <- numeric(n_bootstrap)
+  
+  for(i in 1:n_bootstrap) {
+    #resampling indices
+    bootstrap_indices <- sample(1:nrow(data), replace = TRUE)
+    bootstrap_data <- data[bootstrap_indices, ]
+    bootstrap_response <- response[bootstrap_indices]
+
+
+    #model on bootstrapped dataset
+    boot_cv_fit <- cv.glmnet(bootstrap_data, y=bootstrap_response, alpha=1, nfolds=20, family="binomial")
+    boot_best_lambda <- boot_cv_fit$lambda.min
+
+    #calculate apparent discrimination and calibration
+    data_prob_vte <- predict(app_cv_fit, newx = data, s = app_best_lambda, type = "response")
+    #store apparent values 
+    auc_result_apparent <- roc(response, data_prob_vte[,1], ci = TRUE, direction = "<")
+    apparent_cal <- rms::val.prob(data_prob_vte[,1], response, pl=FALSE)
+    e50_ap <- unname(quantile(abs(data_prob_vte[,1] - approx(lowess(data_prob_vte[,1], response, iter=0), xout=data_prob_vte[,1], ties=mean)$y), 0.5))
+
+        
+    #store bootstrapped values
+    boot_prob_vte <- predict(boot_cv_fit, newx = bootstrap_data, s = boot_best_lambda, type = "response")
+    auc_boot <- roc(bootstrap_response, boot_prob_vte[,1], ci = TRUE, direction = "<")
+    auc_values_boot <- auc_boot$auc
+    boot_cal <- val.prob(boot_prob_vte[,1], bootstrap_response, pl=FALSE)
+    e50_boot <- unname(quantile(abs(boot_prob_vte[,1] - approx(lowess(boot_prob_vte[,1], bootstrap_response, iter=0), xout=boot_prob_vte[,1], ties=mean)$y), 0.5))
+
+
+    #store original values
+    orig_prob_vte <- predict(boot_cv_fit, newx = data, s = boot_best_lambda, type = "response")
+    auc_original <- roc(response, orig_prob_vte[,1], ci = TRUE, direction = "<")
+    auc_values_original <- auc_original$auc
+    orig_cal <- val.prob(orig_prob_vte[,1], response, pl=FALSE)
+    e50_orig <- unname(quantile(abs(orig_prob_vte[,1] - approx(lowess(orig_prob_vte[,1], response, iter=0), xout=orig_prob_vte[,1], ties=mean)$y), 0.5))
+
+    #calculate the optimism corrected score
+    auc_values_corrected[i] <- (auc_result_apparent$auc) - abs(auc_values_boot - auc_values_original)
+    brier_score_corrected[i] <- mean((data_prob_vte[,1] + as.numeric(response))^2) - abs(mean((boot_prob_vte[,1] - bootstrap_response)^2) - mean((orig_prob_vte[,1] - response)^2))
+    emax_corrected[i] <- apparent_cal[[14]] + abs(boot_cal[[14]]  - orig_cal[[14]])
+    ici_corrected[i] <- apparent_cal[[16]] + abs(boot_cal[[16]]  - orig_cal[[16]])
+    e90_corrected[i] <- apparent_cal[[15]] + abs(boot_cal[[15]]  - orig_cal[[15]])
+    r2_corrected[i] <- apparent_cal[[3]] - abs(boot_cal[[3]]  - orig_cal[[3]])
+    e50_corrected[i] <- e50_ap + abs(e50_boot - e50_orig)
+
+
+    #calculate apparent score
+    auc_values_apparent[i] <- auc_result_apparent$auc
+    brier_score_apparent[i] <- mean((data_prob_vte[,1] - response)^2)
+    emax_apparent[i] <- apparent_cal[[14]]
+    ici_apparent[i] <- apparent_cal[[16]]
+    e90_apparent[i] <- apparent_cal[[15]] 
+    r2_apparent[i] <- apparent_cal[[3]] 
+    e50_apparent[i] <- e50_ap
+
+  }
+  
+  #pooling the results directly in the function
+  auc_df <- data.frame(
+    
+    auc_apparent = auc_values_apparent,
+    brier_score_apparent = brier_score_apparent,
+    emax_apparent = emax_apparent,
+    e50_apparent = e50_apparent,
+    e90_apparent = e90_apparent,
+    r2_apparent = r2_apparent,
+    ici_apparent = ici_apparent,
+    
+    auc_corrected = auc_values_corrected,
+    brier_score_corrected = brier_score_corrected,
+    emax_corrected = emax_corrected,
+    e50_corrected = e50_corrected,
+    e90_corrected = e90_corrected,
+    r2_corrected = r2_corrected,
+    ici_corrected = ici_corrected
+  )
+  
+ auc_df_summary <- auc_df  %>%
+  summarise(
+    m_auc_apparent = mean(auc_apparent),
+    se_auc_apparent = sd(auc_apparent, na.rm = TRUE)/sqrt(n_bootstrap),
+    m_auc_corrected = mean(auc_corrected, na.rm = TRUE),
+    se_auc_corrected = sd(auc_corrected, na.rm = TRUE)/sqrt(n_bootstrap),
+    
+    m_brier_score_apparent = mean(brier_score_apparent, na.rm = TRUE),
+    se_brier_score_apparent = sd(brier_score_apparent, na.rm = TRUE)/sqrt(n_bootstrap),
+    m_brier_score_corrected = mean(brier_score_corrected, na.rm = TRUE),
+    se_brier_score_corrected = sd(brier_score_corrected, na.rm = TRUE)/sqrt(n_bootstrap),
+    
+    m_emax_apparent = mean(emax_apparent, na.rm = TRUE),
+    se_emax_apparent = sd(emax_apparent, na.rm = TRUE)/sqrt(n_bootstrap),
+    m_emax_corrected = mean(emax_corrected, na.rm = TRUE),
+    se_emax_corrected = sd(emax_corrected)/sqrt(n_bootstrap),
+    
+    m_e50_apparent = mean(e50_apparent, na.rm = TRUE),
+    se_e50_apparent = sd(e50_apparent)/sqrt(n_bootstrap),
+    m_e50_corrected = mean(e50_corrected, na.rm = TRUE),
+    se_e50_corrected = sd(e50_corrected)/sqrt(n_bootstrap),
+    
+    m_e90_apparent = mean(e90_apparent, na.rm = TRUE),
+    se_e90_apparent = sd(e90_apparent)/sqrt(n_bootstrap),
+    m_e90_corrected = mean(e90_corrected, na.rm = TRUE),
+    se_e90_corrected = sd(e90_corrected)/sqrt(n_bootstrap),
+    
+    m_ici_apparent = mean(ici_apparent, na.rm = TRUE),
+    se_ici_apparent = sd(ici_apparent)/sqrt(n_bootstrap),
+    m_ici_corrected = mean(ici_corrected, na.rm = TRUE),
+    se_ici_corrected = sd(ici_corrected)/sqrt(n_bootstrap),
+    
+    m_r2_apparent = mean(r2_apparent, na.rm = TRUE),
+    se_r2_apparent = sd(r2_apparent)/sqrt(n_bootstrap),
+    m_r2_corrected = mean(r2_corrected, na.rm = TRUE),
+    se_r2_corrected = sd(r2_corrected)/sqrt(n_bootstrap)
+    
+  )
+  return(auc_df_summary)
+}
+```
+
+**Loading the development data set, running the boostrap validation, and making summary tables**
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+mimic_imp <- readRDS("analysis subsets/mimic_imp.RDS")
+
+number_df <- mimic_imp$m
+n_bootstrap <- 200
+results_list <- list()
+
+  #loop through each imputed dataset
+for (i in 1:number_df) {
+  # Complete the dataset
+  data_i <- complete(mimic_imp, action = i)
+  
+  #create model matrix for binary outcome
+xfactors <- model.matrix(data_i$status_dich ~ 
+                           data_i$malignancy + 
+                           data_i$previousvte + 
+                           data_i$cvl + 
+                           data_i$vasoactives + 
+                           data_i$mech_vent + 
+                           data_i$surgical_30_days +
+                           data_i$anticoag_proph_24
+)[, -1]
+
+#subset remaining (cont.) variables
+data_cont <- data_i %>%
+  select(weight, wbc, median_heart_rate, rr_median, median_bp_map,  median_temp, lactate)
+
+#create matrix of all variables
+data_matrix <- as.matrix(cbind(xfactors, data_cont))
+
+y_data_i <- data_i$status_dich
+
+    
+#fit on apparent set
+app_cv_fit_i <- cv.glmnet(data_matrix, y=y_data_i, alpha=1, nfolds=20, family="binomial")
+app_best_lambda_i <- app_cv_fit_i$lambda.min
+  
+  #apply the bootstrap validation function
+  results_list[[i]] <- bootstrap_validation_logreg(data_matrix, y_data_i, app_cv_fit_i, app_best_lambda_i, n_bootstrap)
+}
+
+#combine all results into a single data frame
+results_df <- bind_rows(results_list)
+
+#pool the results according to rubins rules
+final_results_internal_validation <- results_df %>%
+  summarise(
+    auc_apparent = mean(m_auc_apparent, na.rm = TRUE),
+    se_auc_apparent = sqrt(sd(m_auc_apparent, na.rm = TRUE)^2 + mean(se_auc_apparent^2, na.rm = TRUE) + (sd(m_auc_apparent, na.rm = TRUE)^2)/number_df),
+    
+    auc_corrected = mean(m_auc_corrected, na.rm = TRUE),
+    se_auc_corrected = sqrt(sd(m_auc_corrected, na.rm = TRUE)^2 + mean(se_auc_corrected^2, na.rm = TRUE) + (sd(m_auc_corrected, na.rm = TRUE)^2)/number_df),
+    
+    brier_score_apparent = mean(m_brier_score_apparent, na.rm = TRUE),
+    se_brier_score_apparent = sqrt(sd(m_brier_score_apparent, na.rm = TRUE)^2 + mean(se_brier_score_apparent^2) + (sd(m_brier_score_apparent, na.rm = TRUE)^2)/number_df),
+    
+    brier_score_corrected = mean(m_brier_score_corrected, na.rm = TRUE),
+    se_brier_score_corrected = sqrt(sd(m_brier_score_corrected, na.rm = TRUE)^2 + mean(se_brier_score_corrected^2) + (sd(m_brier_score_corrected, na.rm = TRUE)^2)/number_df),
+    
+    e50_apparent = mean(m_e50_apparent, na.rm = TRUE),
+    se_e50_apparent = sqrt(sd(m_e50_apparent, na.rm = TRUE)^2 + mean(se_e50_apparent^2, na.rm = TRUE) + (sd(m_e50_apparent, na.rm = TRUE)^2)/number_df),
+    
+    e50_corrected = mean(m_e50_corrected, na.rm = TRUE),
+    se_e50_corrected = sqrt(sd(m_e50_corrected, na.rm = TRUE)^2 + mean(se_e50_corrected^2, na.rm = TRUE) + (sd(m_e50_corrected, na.rm = TRUE)^2)/number_df),
+    
+    emax_apparent = mean(m_emax_apparent, na.rm = TRUE),
+    se_emax_apparent = sqrt(sd(m_emax_apparent, na.rm = TRUE)^2 + mean(se_emax_apparent^2, na.rm = TRUE) + (sd(m_emax_apparent, na.rm = TRUE)^2)/number_df),
+    
+    emax_corrected = mean(m_emax_corrected, na.rm = TRUE),
+    se_emax_corrected = sqrt(sd(m_emax_corrected, na.rm = TRUE)^2 + mean(se_emax_corrected^2, na.rm = TRUE) + (sd(m_emax_corrected, na.rm = TRUE)^2)/number_df),
+    
+    e90_apparent = mean(m_e90_apparent, na.rm = TRUE),
+    se_e90_apparent = sqrt(sd(m_e90_apparent, na.rm = TRUE)^2 + mean(se_e90_apparent^2, na.rm = TRUE) + (sd(m_e90_apparent, na.rm = TRUE)^2)/number_df),
+    e90_corrected = mean(m_e90_corrected, na.rm = TRUE),
+    se_e90_corrected = sqrt(sd(m_e90_corrected, na.rm = TRUE)^2 + mean(se_e90_corrected^2, na.rm = TRUE) + (sd(m_e90_corrected, na.rm = TRUE)^2)/number_df),
+    
+    r2_apparent = mean(m_r2_apparent, na.rm = TRUE),
+    se_r2_apparent = sqrt(sd(m_r2_apparent, na.rm = TRUE)^2 + mean(se_r2_apparent^2, na.rm = TRUE) + (sd(m_r2_apparent, na.rm = TRUE)^2)/number_df),
+    r2_corrected = mean(m_r2_corrected, na.rm = TRUE),
+    se_r2_corrected = sqrt(sd(m_r2_corrected, na.rm = TRUE)^2 + mean(se_r2_corrected^2, na.rm = TRUE) + (sd(m_r2_corrected, na.rm = TRUE)^2)/number_df),
+    
+    ici_apparent = mean(m_ici_apparent, na.rm = TRUE),
+    se_ici_apparent = sqrt(sd(m_ici_apparent, na.rm = TRUE)^2 + mean(se_ici_apparent^2, na.rm = TRUE) + (sd(m_ici_apparent, na.rm = TRUE)^2)/number_df),
+    ici_corrected = mean(m_ici_corrected, na.rm = TRUE),
+    se_ici_corrected = sqrt(sd(m_ici_corrected, na.rm = TRUE)^2 + mean(se_ici_corrected^2, na.rm = TRUE) + (sd(m_ici_corrected, na.rm = TRUE)^2)/number_df)
+    
+  )
+
+#extract metrics
+df_metrics <- pivot_longer(final_results_internal_validation, 
+                        cols = -starts_with("se_"), 
+                        names_to = "metric", 
+                        values_to = "value")
+
+#extract the se columns into a separate data frame
+df_se <- pivot_longer(final_results_internal_validation, 
+                      cols = starts_with("se_"), 
+                      names_to = "metric_se", 
+                      values_to = "se")
+
+#remove 'se_' prefix to match metric names so we can left join them
+df_se$metric_se <- sub("se_", "", df_se$metric_se)
+
+#merge the value and se columns by matching metric names
+all_metrics_df <- left_join(df_metrics, df_se, by = c("metric" = "metric_se"))
+
+# Rename the columns appropriately
+all_metrics_df <- all_metrics_df %>% select(metric, value, se)
+
+
+all_metrics_df <- all_metrics_df %>%
+  mutate(
+    value = signif(value, digits = 3),
+    lower_ci = signif(value - se*1.96, digits = 3),
+    upper_ci= signif(value + se*1.96, digits = 3),
+     `Value (95% CI)` = paste(value, paste("(", lower_ci, "-",upper_ci, ")", sep = "")))%>%
+  select(Metric = metric, `Value (95% CI)` )
+
+
+apparent_metrics_df <- all_metrics_df %>%
+  filter(grepl("apparent", Metric)) %>%
+  mutate(Metric = gsub("_.*", "", Metric)) %>%
+  select(Metric, `Apparent value (95% CI)` = `Value (95% CI)`)
+
+corrected_metrics_df <- all_metrics_df %>%
+  filter(grepl("corrected", Metric)) %>%
+  mutate(Metric = gsub("_.*", "", Metric)) %>%
+  select(Metric, `Corrected value (95% CI)` = `Value (95% CI)`)
+
+printable_internal_validation <- left_join(apparent_metrics_df, corrected_metrics_df, by = "Metric") %>%
+  filter(Metric != "aic" & Metric != "r2" & Metric != "brier") %>%
+  mutate(Metric = case_when(
+    Metric == "auc" ~ "C-statistic",
+    Metric == "emax" ~ "Emax",
+    Metric == "e50" ~ "E50",
+    Metric == "e90" ~ "E90",
+    Metric == "ici" ~ "Integrated Calibration Index"
+  ))%>%
+  mutate(Metric = factor(Metric, levels = c("C-statistic", "Integrated Calibration Index",  "E50", "E90", "Emax"))) %>%
+  arrange(Metric) %>%
+  kbl("html", escape = FALSE) %>%
+  kable_classic(full_width = F, html_font = "Times")
+
+```
+
+**Extracting the coefficients as described in Musoro et al (DOI:10.1186/1471-2288-14-116)**
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+number_df <- mimic_imp$m #number of data frames
+coefficients_list <- list() #initialize list to store coefficients from each df
+
+for (i in 1:number_df) {
+  data_i <- complete(mimic_imp, action = i)
+  
+  #create model matrix
+  xfactors <- model.matrix(data_i$status_dich ~ 
+                           data_i$malignancy + 
+                           data_i$previousvte + 
+                           data_i$cvl + 
+                           data_i$vasoactives + 
+                           data_i$mech_vent + 
+                           data_i$surgical_30_days +
+                           data_i$anticoag_proph_24
+                         )[, -1]
+  
+  #subset remaining continuous variables
+  data_i_cont <- data_i %>%
+    select(weight, wbc, median_heart_rate, rr_median, median_bp_map, median_temp, lactate)
+  
+  #create matrix of all variables
+  data_i_matrix <- as.matrix(cbind(data_i_cont, xfactors))
+  
+  #prepare response variable
+  y_data_i <- data_i$status_dich
+  
+  #cross-validation to find the best lambda
+  cv_fit <- cv.glmnet(data_i_matrix, y=y_data_i, alpha=1, nfolds=20)
+  best.lambda <- cv_fit$lambda.min
+  
+  #fit the model with the best lambda
+  fit_best <- glmnet(data_i_matrix, y_data_i, alpha=1, family="binomial", lambda=best.lambda, intercept = TRUE)
+  
+  #extract and clean coefficients
+  coefficients <- coef(fit_best, s=best.lambda) %>%
+    as.matrix() %>%
+    as.data.frame() %>%
+    rownames_to_column(var = "term") %>%
+    rename(estimate = s1) %>%
+    select(term, estimate) %>%
+    mutate(term = str_replace(term, "data_i\\$", ""))
+  
+  #add to list
+  coefficients_list[[i]] <- coefficients
+}
+
+coefficients <- bind_rows(coefficients_list) %>%
+  group_by(term) %>%
+  summarise(estimate = mean(estimate)) %>%
+  ungroup()
+
+```
+
+**Calculating the average predicted risk per patient in the development cohort using the extracted coefficients**
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+mimic_long <- complete(mimic_imp, "long")
+mimic_prob <- mimic_long %>%
+  mutate(odds_vte = exp(coefficients$estimate[coefficients$term == "(Intercept)"] + 
+                        coefficients$estimate[coefficients$term == "cvl1"] * cvl1 + 
+                        coefficients$estimate[coefficients$term == "previousvte1"] * previousvte1 + 
+                         coefficients$estimate[coefficients$term == "mech_vent1"] * mech_vent1 +
+                         coefficients$estimate[coefficients$term == "median_temp"] * median_temp +
+                         coefficients$estimate[coefficients$term == "median_heart_rate"] * median_heart_rate +
+                         coefficients$estimate[coefficients$term == "median_bp_map"] * median_bp_map +
+                         coefficients$estimate[coefficients$term == "weight"] * weight +
+                         coefficients$estimate[coefficients$term == "vasoactives1"] * vasoactives1 +
+                         coefficients$estimate[coefficients$term == "malignancy1"] * malignancy1 +
+                         coefficients$estimate[coefficients$term == "wbc"] * wbc +
+                         coefficients$estimate[coefficients$term == "rr_median"] * rr_median +
+                         coefficients$estimate[coefficients$term == "anticoag_proph_241"] * anticoag_proph_241 +
+                         coefficients$estimate[coefficients$term == "lactate"] * lactate +
+                         coefficients$estimate[coefficients$term == "surgical_30_days1"] * surgical_30_days1
+
+),
+         prob_vte = odds_vte / (1 + odds_vte)) %>%
+  group_by(.id) %>%
+  summarise(prob_vte = mean(prob_vte),
+            status_dich = max(status_dich)) %>%
+  ungroup()
+```
+
+**Making calibration + density plot for internal validation**
+```{r message=FALSE, warning=FALSE, eval=FALSE}
+#the calibration plot according to https://darrendahly.github.io/post/homr/        
+percentile_95 <- quantile(mimic_prob$prob_vte, probs = 0.95)
+
+internal_validation_1 <- ggplot(mimic_prob, aes(x = prob_vte, y = status_dich)) +
+ geom_smooth(color = "darkblue", method = "loess", se = FALSE, size = 0.5, span = 0.75) + # LOESS smooth line
+  stat_smooth(color = "darkred", method="glm", family="binomial", se=F, size = 0.5) +
+  geom_vline(xintercept = percentile_95, linetype = "dashed", color = "gray", size = 0.5) + # 95th percentile line
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 1), breaks = seq(0, 1, by = 0.05)) +
+  scale_x_continuous(expand = c(0, 0), limits = c(0, 1), breaks = seq(0, 1, by = 0.05)) +
+  geom_abline(size = 4, alpha = 0.5, color = "gray") + # Adds a line with a slope of 1 and intercept of 0 by default
+  xlab("") +
+  ylab("Observed Probability") +
+  theme_minimal() +
+  ggtitle(expression(bold("Figure x.") ~ "Calibration curve of internal validation")) +
+  coord_cartesian(xlim = c(0, 0.45), ylim = c(0, 0.45)) +
+  theme(plot.title = element_text(hjust = 0.5, family = "Times New Roman", face = "bold"),
+        text = element_text(family = "Times New Roman"),
+        panel.background = element_rect(fill = "white", colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, size=1),
+        axis.title.x = element_blank(), 
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+        plot.margin = unit(c(1,1,0,1), "lines"))
+
+internal_validation_2 <- ggplot(mimic_prob, aes(x = prob_vte)) +
+  geom_histogram(color = "black", fill = NA, binwidth = 0.001) + 
+  scale_x_continuous(limits = c(0, 0.45), breaks = seq(0, 0.45, by = 0.05)) +
+  xlab("Predicted Probability") +
+  ylab("") +
+  theme_minimal() +
+  theme(text = element_text(family = "Times New Roman"),
+        panel.background = element_rect(fill = "white", colour = NA), # Remove border color
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.y = element_text(colour = "white"),
+        panel.border = element_blank(),  # Remove border around the panel
+        plot.margin = unit(c(1, -0.6, 1, -0.75), "lines")) +  # Reduce padding around the plot
+  geom_segment(aes(x = 0, y = 0, xend = 0.45, yend = 0), color = "black", size = 0.05) # Add manual border for x-axis from x=0 to x=0.35
+
+
+legend_plot <- ggplot(data.frame(x = c(0, 1), y = c(0, 1)), aes(x, y)) +
+  geom_line(aes(color = "Logistic calibration"), size = 0.5) +
+  geom_line(aes(color = "Locally estimated scatterplot smoothing"), size = 0.5) +
+    geom_line(aes(color = "95% Percentile of Predicted Risks"), size = 0.5, linetype = "dashed") +
+  geom_line(size = 10, show.legend = FALSE, color = "white", fill = "white") + # Do not show in legend
+  scale_color_manual("", 
+                     values = c("Logistic calibration" = "darkred", 
+                                "Locally estimated scatterplot smoothing" = "darkblue",
+                                "95% Percentile of Predicted Risks" = "gray"
+                                )) +
+  theme(legend.position = "top", 
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.title = element_blank(),
+        axis.title.x = element_blank(), 
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_blank(), 
+        axis.ticks.y = element_blank(),
+        axis.text.x= element_blank(),
+        axis.text.y = element_blank(),
+        panel.border = element_blank(),
+        legend.text = element_text(size = 10, family = "Times New Roman"),
+        legend.background = element_rect(fill = "white"),
+        legend.key = element_blank())
+
+
+
+#combining the adjusted plots
+internal_validation_calibration <- arrangeGrob(internal_validation_1, internal_validation_2, legend_plot, 
+                             heights = unit(c(3, 1, 0.6), "null"), ncol = 1)
+```
+
+**Save R environment**
+```{r, eval=FALSE}
+save.image(file ='lasso_mi_environment.RData')
+```
+
+**Load R environment**
+```{r}
+load('lasso_mi_environment.RData')
+```
+
+**Presenting model coefficients**
+```{r message=FALSE, warning=FALSE}
+coefficients%>%
+  mutate(  term = case_when(
+    term == "rr_median" ~ "Respiratory rate per 5 unit increase",
+    term == "median_bp_map" ~ "Mean arterial blood pressure per 10 mmHg increase",
+    term == "lactate" ~ "Lactate per 1 mmol/L increase",
+    term == "weight" ~ "Weight per 10 kg increase",
+    term == "wbc" ~ "White blood cell count per 5 K/uL increase",
+    term == "age" ~ "Age per 10 year increase",
+    term == "median_heart_rate" ~ "Heart rate per 10 bpm increase",
+    term == "vasoactives1" ~ "Vasopressors within 24 hours of ICU admission",
+    term == "mech_vent1" ~ "Mechanical ventilation within 24 hours of ICU admission",
+    term == "malignancy1" ~ "Active malignancy",
+    term == "surgical_30_days1" ~ "Surgical ICU admission",
+    term == "previousvte1" ~ "Personal history of VTE",
+    term == "cvl1" ~ "Central venous line within 24 hours of ICU admission",
+    term == "(Intercept)" ~ "Intercept",
+    term == "anticoag_proph_241" ~ "Thromboprophylaxis within 24 hours of ICU admission",
+    term == "median_temp" ~ "Body temperature per 1°C increase",
+    TRUE ~ term
+  )) %>%
+    select(Term = term, Coefficients = estimate) %>%
+  kbl("html", escape = FALSE) %>%
+  kable_classic(full_width = F, html_font = "Times")
+```
+
+**Summary table for internal validation**
+```{r message=FALSE, warning=FALSE}
+printable_internal_validation
+```
+
+**Calibration in development set**
+```{r fig.height=8, fig.width=8}
+grid.newpage()
+grid.draw(internal_validation_calibration)
+```
