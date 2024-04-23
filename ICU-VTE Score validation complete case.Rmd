@@ -1,0 +1,284 @@
+---
+title: "ICU-VTE Score validation, complete case analysis"
+author: "SCS Rivrud, RJ Eck, ERH Heijkoop"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(data.table)
+library(kableExtra)
+library(lubridate)
+knitr::opts_chunk$set(echo = TRUE)
+library(here)
+library(DBI)
+library(RSQLite)
+library(gtsummary)
+library(reshape2)
+library(dbplyr)
+library(stringr)
+library(readxl)
+library(writexl)
+library(stringi)
+library(rms)
+library(gmish)
+library(glmnet)
+library(pec)
+library(Hmisc)
+library(qreport)
+library(DescTools)
+library(e1071)
+library(ggpubr)
+library(bestNormalize)
+library(GGally)
+library(MASS)
+library(pROC)
+library(rsample)
+library(riskRegression)
+library(here)
+library(tidyverse)
+library(RSQLite)
+library(survival)
+library(survminer)
+library(dplyr)
+library(gridExtra)
+library(grid)
+library(adjustedCurves)
+library(dcurves)
+
+```
+
+**Load data**
+```{r}
+mimic <- readRDS("analysis subsets/icu_vte_mimic.rds") %>%
+  mutate(platelets_scaled = platelets/100) %>%
+  na.omit() #remove all NAs
+
+```
+
+**Write function for external validation with bootstrapping**
+```{r include=FALSE}
+#define bootstrap function
+bootstrap_validation_logreg_external <- function(data, n_bootstrap) {
+  
+  #make storage for apparent values (original model tested on bootstrap dataset)
+  auc_values_apparent <- numeric(n_bootstrap)
+  brier_score_apparent <- numeric(n_bootstrap) 
+  emax_apparent <- numeric(n_bootstrap)
+  e50_apparent <- numeric(n_bootstrap)
+  e90_apparent <- numeric(n_bootstrap)
+  r2_apparent <- numeric(n_bootstrap)
+  ici_apparent <- numeric(n_bootstrap)
+
+  for(i in 1:n_bootstrap) {
+    #resampling indices
+    bootstrap_data <- sample_n(data, nrow(data), replace = TRUE)
+
+            #predict on the bootstrap sample
+    bootstrap_data <- bootstrap_data %>%
+      mutate(#based on model in supplementary material of Viarasilpa et al
+         odds_vte = exp(-7.1142 + 2.0308*cvl_num + 0.8928*mech_vent_num + 1.4384*previousvte_num + 0.13103*platelets_scaled + 0.0412*total_immobile_days + 0.8020*hb_cutoff + (-0.8078*ffp_num)),
+         
+         prob_vte = odds_vte / (1 + odds_vte)
+         )
+    
+    #store apparent values
+    auc_result_apparent <- roc(bootstrap_data$status_dich, bootstrap_data$prob_vte, ci = TRUE, direction = "<")
+    apparent_cal <- val.prob(bootstrap_data$prob_vte, bootstrap_data$status_dich)
+    auc_values_apparent[i] <- auc_result_apparent$auc
+    brier_score_apparent[i] <- mean((bootstrap_data$prob_vte - as.numeric(bootstrap_data$status_dich))^2)
+    emax_apparent[i] <- apparent_cal[[14]]
+    e50_apparent[i] <- unname(quantile(abs(bootstrap_data$prob_vte - approx(lowess(bootstrap_data$prob_vte, bootstrap_data$status_dich, iter=0), xout=bootstrap_data$prob_vte, ties=mean)$y), 0.5))
+    e90_apparent[i] <- apparent_cal[[15]] 
+    r2_apparent[i] <- apparent_cal[[3]] 
+    ici_apparent[i] <- apparent_cal[[16]]
+    
+  }
+  
+  #pooling the results directly in the function
+  auc_df <- data.frame(
+    auc_apparent = auc_values_apparent,
+    brier_score_apparent = brier_score_apparent,
+    emax_apparent = emax_apparent,
+    e50_apparent = e50_apparent,
+    e90_apparent = e90_apparent,
+    r2_apparent = r2_apparent,
+    ici_apparent = ici_apparent
+    
+  )
+  
+  #summary of results (sd pooled according to cohen 1988 https://www.statisticshowto.com/pooled-standard-deviation/)
+  auc_df_summary <- auc_df %>%
+    summarise(
+     m_auc_apparent = mean(auc_apparent),
+    se_auc_apparent = sd(auc_apparent, na.rm = TRUE)/sqrt(n_bootstrap),
+    
+    m_brier_score_apparent = mean(brier_score_apparent, na.rm = TRUE),
+    se_brier_score_apparent = sd(brier_score_apparent, na.rm = TRUE)/sqrt(n_bootstrap),
+    
+    m_e50_apparent = mean(e50_apparent, na.rm = TRUE),
+    se_e50_apparent = sd(e50_apparent)/sqrt(n_bootstrap),
+
+    m_emax_apparent = mean(emax_apparent, na.rm = TRUE),
+    se_emax_apparent = sd(emax_apparent, na.rm = TRUE)/sqrt(n_bootstrap),
+ 
+    m_e90_apparent = mean(e90_apparent, na.rm = TRUE),
+    se_e90_apparent = sd(e90_apparent)/sqrt(n_bootstrap),
+
+    m_r2_apparent = mean(r2_apparent, na.rm = TRUE),
+    se_r2_apparent = sd(r2_apparent)/sqrt(n_bootstrap),
+    
+    m_ici_apparent = mean(ici_apparent, na.rm = TRUE),
+    se_ici_apparent = sd(ici_apparent)/sqrt(n_bootstrap)
+
+    )
+  
+  return(auc_df_summary)
+}
+```
+
+**Perform external validation and make summary tables**
+```{r include=FALSE}
+n_bootstrap <- 200
+results_list <- list()
+
+data_i <- mimic %>%
+  mutate(platelets_scaled = platelets/100)
+
+#apply the bootstrap validation function
+final_results_external_validation <- bootstrap_validation_logreg_external(data_i, n_bootstrap)
+
+#extract metrics
+df_metrics <- pivot_longer(final_results_external_validation, 
+                        cols = -starts_with("se_"), 
+                        names_to = "metric", 
+                        values_to = "value")
+
+#extract the se columns into a separate data frame
+df_se <- pivot_longer(final_results_external_validation, 
+                      cols = starts_with("se_"), 
+                      names_to = "metric_se", 
+                      values_to = "se")
+
+#remove 'se_' prefix to match metric names so we can left join them
+df_se$metric_se <- sub("se_", "", df_se$metric_se)
+df_metrics$metric <- sub("m_", "", df_metrics$metric)
+
+#merge the value and se columns by matching metric names
+all_metrics_df <- left_join(df_metrics, df_se, by = c("metric" = "metric_se"))
+
+# Rename the columns appropriately
+all_metrics_df <- all_metrics_df %>% 
+  dplyr::select(metric, value, se)
+
+#make nice table
+printable_external_validation <- all_metrics_df %>%
+  filter(metric != "r2_apparent") %>%
+  mutate(
+    value = signif(value, digits = 3),
+    lower_ci = signif(value - se*1.96, digits = 3),
+    upper_ci= signif(value + se*1.96, digits = 3),
+     `Value (95% CI)` = paste(value, paste("(", lower_ci, "-",upper_ci, ")", sep = "")))%>%
+  dplyr::select(Metric = metric, `Apparent value (95% CI)` = `Value (95% CI)`)%>%
+   mutate(Metric = case_when(
+    Metric == "auc_apparent" ~ "C-statistic",
+    Metric == "brier_score_apparent" ~ "Brier score",
+    Metric == "emax_apparent" ~ "Emax",
+    Metric == "e50_apparent" ~ "E50",
+    Metric == "e90_apparent" ~ "E90",
+    Metric == "ici_apparent" ~ "ICI"
+  ))%>%
+  kbl("html", escape = FALSE) %>%
+  kable_classic(full_width = F, html_font = "Times")
+```
+
+**Calculate risk of VTE per subject and make calibration plot**
+```{r}
+mimic_prob <- mimic %>%
+      mutate(#based on model in supplementary material of viarasilpa et al
+        platelets_scaled = platelets/100,
+         odds_vte = exp(-7.1142 + 2.0308*cvl_num + 0.8928*mech_vent_num + 1.4384*previousvte_num + 0.13103*platelets_scaled + 0.0412*total_immobile_days + 0.8020*hb_cutoff + (-0.8078*ffp_num)),
+         
+         prob_vte = odds_vte / (1 + odds_vte)
+         )
+
+percentile_95 <- quantile(mimic_prob$prob_vte, probs = 0.95)
+
+external_validation_1 <- ggplot(mimic_prob, aes(x = prob_vte, y = status_dich)) +
+  geom_smooth(color = "darkblue", method = "loess", se = FALSE, size = 0.5, span = 0.75) + # LOESS smooth line
+  stat_smooth(color = "darkred", method="glm", family="binomial", se=F, size = 0.5) +
+  geom_vline(xintercept = percentile_95, linetype = "dashed", color = "gray", size = 0.5) + # 95th percentile line
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 1), breaks = seq(0, 1, by = 0.05)) +
+  scale_x_continuous(expand = c(0, 0), limits = c(0, 1), breaks = seq(0, 1, by = 0.05)) +
+  geom_abline(size = 4, alpha = 0.5, color = "gray") + # Adds a line with a slope of 1 and intercept of 0 by default
+  xlab("") +
+  ylab("Observed Probability") +
+  theme_minimal() +
+  ggtitle(expression(bold("Figure x.") ~ "Calibration plot of external validation of the ICU-VTE score")) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+  theme(plot.title = element_text(hjust = 0.5, family = "Times New Roman", face = "bold"),
+        text = element_text(family = "Times New Roman"),
+        panel.background = element_rect(fill = "white", colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, size=1),
+        axis.title.x = element_blank(), 
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+        plot.margin = unit(c(1,1,0,1), "lines"))
+
+external_validation_2 <- ggplot(mimic_prob, aes(x = prob_vte)) +
+  geom_histogram(color = "black", fill = NA, binwidth = 0.001) + 
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.05)) +
+  xlab("Predicted Probability") +
+  ylab("") +
+  theme_minimal() +
+  theme(text = element_text(family = "Times New Roman"),
+        panel.background = element_rect(fill = "white", colour = NA), # Remove border color
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.y = element_text(colour = "white"),
+        panel.border = element_blank()) + # Add line for x-axis border
+  geom_segment(aes(x = 0, y = 0, xend = 1, yend = 0), color = "black", size = 0.05) # Add manual border for x-axis from x=0 to x=0.35
+
+legend_plot <- ggplot(data.frame(x = c(0, 1), y = c(0, 1)), aes(x, y)) +
+  geom_line(aes(color = "Logistic calibration"), size = 0.5) +
+  geom_line(aes(color = "Locally estimated scatterplot smoothing"), size = 0.5) +
+  geom_line(aes(color = "95% Percentile of Predicted Risks"), size = 0.5, linetype = "dashed") +
+  geom_line(size = 10, show.legend = FALSE, color = "white", fill = "white") + # Do not show in legend
+  scale_color_manual("", 
+                     values = c("Logistic calibration" = "darkred", 
+                                "Locally estimated scatterplot smoothing" = "darkblue",
+                                "95% Percentile of Predicted Risks" = "gray"
+                     )) +
+  theme(legend.position = "top", 
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.title = element_blank(),
+        axis.title.x = element_blank(), 
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_blank(), 
+        axis.ticks.y = element_blank(),
+        axis.text.x= element_blank(),
+        axis.text.y = element_blank(),
+        panel.border = element_blank(),
+        legend.text = element_text(size = 10, family = "Times New Roman"),
+        legend.background = element_rect(fill = "white"),
+        legend.key = element_blank())
+
+#combining the adjusted plots
+external_validation_calibration <- arrangeGrob(external_validation_1, external_validation_2, legend_plot, 
+                                               heights = unit(c(3, 1, 0.6), "null"), ncol = 1)
+```
+
+**External validation stats**
+```{r}
+printable_external_validation
+```
+
+**print external validation calibration plot**
+```{r fig.height=8, fig.width=8}
+grid.newpage()
+grid.draw(external_validation_calibration)
+```
