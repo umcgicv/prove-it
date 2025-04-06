@@ -551,7 +551,6 @@ coefficients%>%
     term == "lactate" ~ "Lactate per 1 mmol/L increase",
     term == "weight" ~ "Weight per 10 kg increase",
     term == "wbc" ~ "White blood cell count per 5 K/uL increase",
-    term == "age" ~ "Age per 10 year increase",
     term == "median_heart_rate" ~ "Heart rate per 10 bpm increase",
     term == "vasoactives1" ~ "Vasopressors within 24 hours of ICU admission",
     term == "mech_vent1" ~ "Mechanical ventilation within 24 hours of ICU admission",
