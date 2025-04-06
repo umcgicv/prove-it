@@ -468,7 +468,7 @@ bootstrap_validation_logreg <- function(data, n_bootstrap) {
 }
 ```
 
-**Boostrap function for internal validation**
+**Boostrap function for external validation**
 ```{r, eval=FALSE}
 #define bootstrap function
 bootstrap_validation_logreg_external <- function(data, n_bootstrap) {
