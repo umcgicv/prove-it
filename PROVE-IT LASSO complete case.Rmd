@@ -243,7 +243,6 @@ mimic <- mimic %>%
          rr_median = rr_median/5,
          lactate = lactate,
          wbc = wbc/5,
-         age = age/10,
          weight = weight/10,
          median_bp_map = median_bp_map/10,
          median_heart_rate = median_heart_rate/10
@@ -374,7 +373,6 @@ printable_internal_validation <- left_join(apparent_metrics_df, corrected_metric
     Term == "lactate" ~ "Lactate per 1 mmol/L increase",
     Term == "weight" ~ "Weight per 10 kg increase",
     Term == "wbc" ~ "White blood cell count per 5 K/uL increase",
-    Term == "age" ~ "Age per 10 year increase",
     Term == "median_heart_rate" ~ "Heart rate per 10 bpm increase",
     Term == "vasoactives1" ~ "Vasopressors within 24 hours of ICU admission",
     Term == "mech_vent1" ~ "Mechanical ventilation within 24 hours of ICU admission",
@@ -406,7 +404,6 @@ printable_or <- coefficients  %>%
     Term == "lactate" ~ "Lactate per 1 mmol/L increase",
     Term == "weight" ~ "Weight per 10 kg increase",
     Term == "wbc" ~ "White blood cell count per 5 K/uL increase",
-    Term == "age" ~ "Age per 10 year increase",
     Term == "median_heart_rate" ~ "Heart rate per 10 bpm increase",
     Term == "vasoactives1" ~ "Vasopressors within 24 hours of ICU admission",
     Term == "mech_vent1" ~ "Mechanical ventilation within 24 hours of ICU admission",
