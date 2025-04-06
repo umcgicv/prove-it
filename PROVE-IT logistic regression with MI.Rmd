@@ -206,7 +206,6 @@ or_model <- pooled_model %>%
     term == "lactate" ~ "Lactate per 1 mmol/L increase",
     term == "weight" ~ "Weight per 10 kg increase",
     term == "wbc" ~ "White blood cell count per 5 K/uL increase",
-    term == "age" ~ "Age per 10 year increase",
     term == "median_heart_rate" ~ "Heart rate per 10 bpm increase",
     term == "vasoactives1" ~ "Vasopressors within 24 hours of ICU admission",
     term == "mech_vent1" ~ "Mechanical ventilation within 24 hours of ICU admission",
@@ -242,7 +241,6 @@ odds_ratios_continuous <- or_model %>%
            (grepl("White blood cell count per 5 K/uL increase", term, ignore.case = TRUE) |
             grepl("Heart rate per 10 bpm increase", term, ignore.case = TRUE) |
             grepl("Body temperature per 1°C increase", term, ignore.case = TRUE) |
-            grepl("Age per 10 year increase", term, ignore.case = TRUE) |            
             grepl("Weight per 10 kg increase", term, ignore.case = TRUE) |            
             grepl("Respiratory rate per 5 unit increase", term, ignore.case = TRUE) |            
             grepl("Lactate per 1 mmol/L increase", term, ignore.case = TRUE)        |
@@ -254,7 +252,6 @@ odds_ratios_categorical <- or_model %>%
            (!grepl("White blood cell count per 5 K/uL increase", term, ignore.case = TRUE) &
             !grepl("Heart rate per 10 bpm increase", term, ignore.case = TRUE) &
             !grepl("Body temperature per 1°C increase", term, ignore.case = TRUE) &
-            !grepl("Age per 10 year increase", term, ignore.case = TRUE) &            
             !grepl("Weight per 10 kg increase", term, ignore.case = TRUE) &           
             !grepl("Respiratory rate per 5 unit increase", term, ignore.case = TRUE) &            
             !grepl("Lactate per 1 mmol/L increase", term, ignore.case = TRUE)        &
